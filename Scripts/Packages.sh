@@ -60,7 +60,7 @@ UPDATE_PACKAGE "nikki" "nikkinikki-org/OpenWrt-nikki" "main"
 UPDATE_PACKAGE "openclash" "vernesong/OpenClash" "dev" "pkg"
 UPDATE_PACKAGE "passwall" "Openwrt-Passwall/openwrt-passwall" "main" "pkg"
 UPDATE_PACKAGE "passwall2" "Openwrt-Passwall/openwrt-passwall2" "main" "pkg"
-UPDATE_PACKAGE "luci-app-store" "linkease/istore" "main"
+
 UPDATE_PACKAGE "luci-app-tailscale" "asvow/luci-app-tailscale" "main"
 
 #UPDATE_PACKAGE "athena-led" "unraveloop/JDC-AX6600-Athena-LED-Controller" "main"
@@ -79,7 +79,13 @@ UPDATE_PACKAGE "quickfile" "sbwml/luci-app-quickfile" "main"
 UPDATE_PACKAGE "timecontrol" "sirpdboy/luci-app-timecontrol" "main"
 UPDATE_PACKAGE "viking" "VIKINGYFY/packages" "main" "" "gecoosac luci-app-timewol luci-app-wolplus"
 UPDATE_PACKAGE "vnt" "lmq8267/luci-app-vnt" "main"
+UPDATE_PACKAGE "luci-app-wrtbwmon" "brvphoenix/luci-app-wrtbwmon" "master"
+UPDATE_PACKAGE "wrtbwmon" "brvphoenix/wrtbwmon" "master"
+UPDATE_PACKAGE "luci-app-bandix" "timsaya/luci-app-bandix" "main"
+UPDATE_PACKAGE "openwrt-bandix" "timsaya/openwrt-bandix" "main"
+UPDATE_PACKAGE "luci-app-store" "linkease/istore" "main"
 UPDATE_PACKAGE "turboacc" "mufeng05/luci-app-turboacc" "main"
+
 #更新软件包版本
 UPDATE_VERSION() {
 	local PKG_NAME=$1
