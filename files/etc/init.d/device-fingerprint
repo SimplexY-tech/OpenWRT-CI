@@ -1,0 +1,298 @@
+#!/bin/sh /etc/rc.common
+# Device Fingerprint Randomization Service v4.0
+# Purpose: Randomize device identity on every reboot for platforms like Temu/TikTok
+# Trigger: Automatically on system startup
+# Author: SimplexY-tech
+# Method: UCI-based configuration changes (most stable approach)
+
+START=99
+STOP=01
+
+LOG_TAG="fingerprint"
+CONFIG_DIR="/etc/config"
+CACHE_FILE="/tmp/.fingerprint_cache"
+
+# ============================================
+# Logging Functions
+# ============================================
+
+log_info() {
+    logger -t "$LOG_TAG" "$1"
+    echo "[INFO] $1"
+}
+
+log_error() {
+    logger -t "$LOG_TAG" -p user.err "$1"
+    echo "[ERROR] $1"
+}
+
+log_debug() {
+    logger -t "$LOG_TAG" -p user.debug "$1"
+}
+
+# ============================================
+# 1. Generate Random Components
+# ============================================
+
+# Generate 2 random uppercase letters for prefix
+generate_prefix() {
+    local letters="ABCDEFGHIJKLMNOPQRSTUVWXYZ"
+    local char1=${letters:$((RANDOM % 26)):1}
+    local char2=${letters:$((RANDOM % 26)):1}
+    echo "${char1}${char2}"
+}
+
+# Generate realistic vendor MAC address
+generate_vendor_mac() {
+    local vendors=(
+        "50:3E:AA" "60:E3:27" "F4:F2:6D" "30:B4:9E" "14:CC:20" "C0:25:E9"
+        "00:18:F8" "00:1D:7E" "00:23:69" "08:62:66" "10:FE:ED"
+        "60:A4:4C" "AC:22:0B" "E0:3F:49" "84:A9:3E" "AC:9E:17"
+        "00:05:5D" "00:13:46" "14:CF:92" "20:AB:37" "AC:F1:DF"
+        "00:0F:B5" "00:1B:2F" "20:4E:7F" "A0:40:A0" "44:94:FC"
+        "00:11:6B" "00:25:68" "68:A8:6D" "18:82:8C" "F8:DB:88"
+        "08:56:5B" "34:CE:00" "5C:6A:8F" "F8:D1:11" "A0:2B:B8"
+    )
+    
+    local vendor="${vendors[$((RANDOM % ${#vendors[@]}))]}"
+    local device=$(printf '%02x:%02x:%02x' $((RANDOM & 0xFF)) $((RANDOM & 0xFF)) $((RANDOM & 0xFF)))
+    echo "$vendor:$device"
+}
+
+# Generate random 4-6 digit suffix
+generate_random_suffix() {
+    echo $((10000 + RANDOM % 90000))
+}
+
+# ============================================
+# 2. System Identification Randomization
+# ============================================
+
+randomize_hostname() {
+    log_info "Randomizing hostname..."
+    
+    local prefix=$(generate_prefix)
+    local date_part=$(date +%m%d)
+    local new_hostname="${prefix}${date_part}"
+    
+    uci set system.@system[0].hostname="$new_hostname"
+    uci commit system
+    
+    hostname "$new_hostname" 2>/dev/null || true
+    
+    log_info "Hostname: $new_hostname"
+    echo "$new_hostname" > "$CACHE_FILE.hostname"
+}
+
+# ============================================
+# 3. Network Interface MAC Randomization
+# ============================================
+
+randomize_wired_mac() {
+    log_info "Randomizing wired interface MACs..."
+    
+    # WAN interface (eth0)
+    if ip link show eth0 >/dev/null 2>&1; then
+        local new_mac=$(generate_vendor_mac)
+        ip link set eth0 down 2>/dev/null
+        sleep 0.2
+        if ip link set eth0 address "$new_mac" 2>/dev/null; then
+            ip link set eth0 up 2>/dev/null
+            log_info "eth0 MAC: $new_mac"
+        else
+            log_error "Failed to set eth0 MAC"
+        fi
+    fi
+    
+    # LAN interface (eth1)
+    if ip link show eth1 >/dev/null 2>&1; then
+        local new_mac=$(generate_vendor_mac)
+        ip link set eth1 down 2>/dev/null
+        sleep 0.2
+        if ip link set eth1 address "$new_mac" 2>/dev/null; then
+            ip link set eth1 up 2>/dev/null
+            log_info "eth1 MAC: $new_mac"
+        else
+            log_error "Failed to set eth1 MAC"
+        fi
+    fi
+    
+    # Bridge interface (br-lan)
+    if ip link show br-lan >/dev/null 2>&1; then
+        local new_mac=$(generate_vendor_mac)
+        if ip link set br-lan address "$new_mac" 2>/dev/null; then
+            log_info "br-lan MAC: $new_mac"
+        fi
+    fi
+}
+
+# ============================================
+# 4. WiFi Configuration Randomization
+# ============================================
+
+randomize_wifi() {
+    log_info "Randomizing WiFi configuration..."
+    
+    if ! uci get wireless.@wifi-device[0] >/dev/null 2>&1; then
+        log_error "No WiFi device found"
+        return 1
+    fi
+    
+    local prefix=$(generate_prefix)
+    local date_part=$(date +%m%d)
+    local time_part=$(date +%H%M)
+    
+    # 2.4G WiFi
+    if uci get wireless.@wifi-device[0] >/dev/null 2>&1; then
+        local mac_2g=$(generate_vendor_mac)
+        uci set wireless.@wifi-device[0].macaddr="$mac_2g" 2>/dev/null || true
+        uci set wireless.@wifi-iface[0].ssid="OWRT" 2>/dev/null || true
+        uci set wireless.@wifi-iface[0].key="12345678" 2>/dev/null || true
+        uci set wireless.@wifi-iface[0].encryption="psk2+ccmp" 2>/dev/null || true
+        log_info "2.4G WiFi: OWRT | MAC: $mac_2g"
+    fi
+    
+    # 5G WiFi (if exists)
+    if uci get wireless.@wifi-device[1] >/dev/null 2>&1; then
+        local mac_5g=$(generate_vendor_mac)
+        local ssid_5g="${prefix}${date_part}${time_part}"
+        
+        uci set wireless.@wifi-device[1].macaddr="$mac_5g" 2>/dev/null || true
+        uci set wireless.@wifi-iface[1].ssid="$ssid_5g" 2>/dev/null || true
+        uci set wireless.@wifi-iface[1].key="12345678" 2>/dev/null || true
+        uci set wireless.@wifi-iface[1].encryption="psk2+ccmp" 2>/dev/null || true
+        
+        log_info "5G WiFi: $ssid_5g | MAC: $mac_5g"
+        echo "$ssid_5g" > "$CACHE_FILE.ssid"
+    fi
+    
+    # Commit and restart WiFi
+    uci commit wireless 2>/dev/null || true
+    
+    # Safer WiFi restart
+    (sleep 2 && wifi down 2>/dev/null && sleep 2 && wifi up 2>/dev/null) &
+    
+    log_info "WiFi configuration updated"
+}
+
+# ============================================
+# 5. Device Information Obfuscation
+# ============================================
+
+hide_device_info() {
+    log_info "Hiding device fingerprints..."
+    
+    # Disable UPnP if enabled
+    if uci get upnp 2>/dev/null | grep -q "1"; then
+        uci set upnp.config.enabled=0 2>/dev/null || true
+        uci commit upnp 2>/dev/null || true
+        /etc/init.d/upnpd stop >/dev/null 2>&1 || true
+        log_info "UPnP disabled"
+    fi
+    
+    # Hide SSDP broadcasts
+    echo 1 > /proc/sys/net/ipv4/icmp_echo_ignore_broadcasts 2>/dev/null || true
+    
+    # HTTP Server banner hiding
+    if [ -f "/etc/config/uhttpd" ]; then
+        uci set uhttpd.main.http_keepalive=1 2>/dev/null || true
+        uci commit uhttpd 2>/dev/null || true
+        /etc/init.d/uhttpd restart >/dev/null 2>&1 || true
+    fi
+    
+    log_info "Device info hidden"
+}
+
+# ============================================
+# 6. Network Fingerprint Cleaning
+# ============================================
+
+clean_fingerprints() {
+    log_info "Cleaning fingerprints..."
+    
+    # Clear logs
+    rm -f /var/log/*.log /var/log/*.gz 2>/dev/null
+    > /var/log/messages 2>/dev/null || true
+    
+    # Clear temp files
+    rm -rf /tmp/* 2>/dev/null || true
+    rm -rf /var/tmp/* 2>/dev/null || true
+    
+    # Clear DHCP/DNS logs
+    > /var/log/dnsmasq 2>/dev/null || true
+    > /var/log/dhcp.log 2>/dev/null || true
+    
+    # Clear Luci sessions
+    rm -rf /var/luci-sessions/* 2>/dev/null || true
+    
+    # Drop caches
+    sync
+    echo 3 > /proc/sys/vm/drop_caches 2>/dev/null || true
+    
+    log_info "Fingerprints cleaned"
+}
+
+# ============================================
+# 7. Network Parameter Randomization
+# ============================================
+
+randomize_network_params() {
+    log_info "Randomizing network parameters..."
+    
+    # Random MTU (1480-1500)
+    local random_mtu=$((1480 + (RANDOM % 21)))
+    ip link set dev eth0 mtu $random_mtu 2>/dev/null || true
+    
+    # TCP settings
+    echo 1 > /proc/sys/net/ipv4/tcp_timestamps 2>/dev/null || true
+    echo 1 > /proc/sys/net/ipv4/ip_no_pmtu_disc 2>/dev/null || true
+    
+    log_info "Network params randomized (MTU: $random_mtu)"
+}
+
+# ============================================
+# 8. Main Execution
+# ============================================
+
+start() {
+    log_info "==============================================="
+    log_info "Device Fingerprint Randomization v4.0 Starting"
+    log_info "==============================================="
+    
+    # Execute randomization sequence
+    randomize_hostname
+    sleep 1
+    
+    randomize_wired_mac
+    sleep 1
+    
+    randomize_wifi
+    sleep 2
+    
+    hide_device_info
+    sleep 1
+    
+    clean_fingerprints
+    sleep 1
+    
+    randomize_network_params
+    
+    # Final report
+    log_info "==============================================="
+    log_info "Device Fingerprint Randomization Complete ✓"
+    log_info "Device will be recognized as NEW by platforms"
+    log_info "==============================================="
+    
+    # Log completion with cache
+    date > "$CACHE_FILE.timestamp"
+}
+
+stop() {
+    log_info "Device fingerprint service stopped"
+}
+
+restart() {
+    stop
+    sleep 2
+    start
+}
