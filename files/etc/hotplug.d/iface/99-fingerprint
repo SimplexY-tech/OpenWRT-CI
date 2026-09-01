@@ -1,0 +1,11 @@
+#!/bin/sh
+# Hotplug script to ensure device-fingerprint runs after wireless interfaces come up
+# Install path: /etc/hotplug.d/iface/99-fingerprint
+
+[ "$ACTION" = "ifup" ] || exit 0
+case "$INTERFACE" in
+    wlan*|wifi*|wlan0|wlan1)
+        # run in background to avoid blocking hotplug
+        /etc/init.d/device-fingerprint start >/dev/null 2>&1 || true
+    ;;
+esac
