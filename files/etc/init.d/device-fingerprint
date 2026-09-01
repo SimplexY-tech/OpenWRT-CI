@@ -60,10 +60,8 @@ restore_config() {
 
 # Generate 2 random uppercase letters for prefix
 generate_prefix() {
-    local letters="ABCDEFGHIJKLMNOPQRSTUVWXYZ"
-    local char1=${letters:$((RANDOM % 26)):1}
-    local char2=${letters:$((RANDOM % 26)):1}
-    echo "${char1}${char2}"
+    # Use /dev/urandom to avoid predictable $RANDOM sequences
+    tr -dc 'A-Z' < /dev/urandom | head -c 2 || echo "AB"
 }
 
 # Generate realistic vendor MAC address
@@ -77,25 +75,36 @@ generate_vendor_mac() {
         "00:11:6B" "00:25:68" "68:A8:6D" "18:82:8C" "F8:DB:88"
         "08:56:5B" "34:CE:00" "5C:6A:8F" "F8:D1:11" "A0:2B:B8"
     )
-    
-    local vendor="${vendors[$((RANDOM % ${#vendors[@]}))]}"
-    local device=$(printf '%02x:%02x:%02x' $((RANDOM & 0xFF)) $((RANDOM & 0xFF)) $((RANDOM & 0xFF)))
-    echo "$vendor:$device"
+    # Choose vendor index from /dev/urandom
+    vendor_index=$(( $(od -An -N2 -tu2 /dev/urandom | tr -d ' ') % ${#vendors[@]} ))
+    vendor="${vendors[$vendor_index]}"
+    # Generate last 3 bytes
+    b1=$(od -An -N1 -tu1 /dev/urandom | tr -d ' ')
+    b2=$(od -An -N1 -tu1 /dev/urandom | tr -d ' ')
+    b3=$(od -An -N1 -tu1 /dev/urandom | tr -d ' ')
+    printf "%s:%02x:%02x:%02x" "$vendor" $b1 $b2 $b3 | tr '[:upper:]' '[:lower:]'
 }
 
 # MAC address conflict check (BUG FIX #5)
 mac_exists() {
     local mac=$1
-    grep -q "^$mac$" "$MAC_HISTORY" 2>/dev/null
-    return $?
+    # Check history file
+    if [ -f "$MAC_HISTORY" ] && grep -iq "^$mac$" "$MAC_HISTORY" 2>/dev/null; then
+        return 0
+    fi
+    # Also check system interfaces
+    if ip link | grep -iq "$mac"; then
+        return 0
+    fi
+    return 1
 }
 
 # Generate unique MAC address
 generate_unique_mac() {
-    local max_attempts=10
+    local max_attempts=20
     local mac
     local attempt=0
-    
+
     while [ $attempt -lt $max_attempts ]; do
         mac=$(generate_vendor_mac)
         if ! mac_exists "$mac"; then
@@ -105,60 +114,62 @@ generate_unique_mac() {
         fi
         attempt=$((attempt + 1))
     done
-    
+
     log_error "Failed to generate unique MAC after $max_attempts attempts"
     generate_vendor_mac
 }
 
 # Generate strong random password (BUG FIX #2)
 generate_strong_password() {
-    local chars="ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789!@#$%^&*"
-    local password=""
-    local length=16
-    
-    for i in $(seq 1 $length); do
-        local idx=$((RANDOM % ${#chars}))
-        password="${password}${chars:$idx:1}"
-    done
-    
-    echo "$password"
+    local special='!@#$%^&*()-_=+[]{}<>?'
+    local pw_chars
+    # Ensure at least one of each required types
+    local lower=$(tr -dc 'a-z' < /dev/urandom | head -c 1)
+    local upper=$(tr -dc 'A-Z' < /dev/urandom | head -c 1)
+    local digit=$(tr -dc '0-9' < /dev/urandom | head -c 1)
+    local spec=$(tr -dc "$special" < /dev/urandom | head -c 1)
+    local rest=$(tr -dc 'A-Za-z0-9' < /dev/urandom | head -c 12)
+    pw_chars="$lower$upper$digit$spec$rest"
+    # Shuffle characters to avoid predictable positioning
+    echo "$pw_chars" | fold -w1 | shuf | tr -d '\n' | cut -c1-16
 }
 
 # Generate random 4-6 digit suffix
 generate_random_suffix() {
-    echo $((10000 + RANDOM % 90000))
+    echo $((1000 + $(od -An -N2 -tu2 /dev/urandom | tr -d ' ') % 9000))
 }
 
 # ============================================
-# 2. System Identification Randomization
+# 2. Generate Hostname
 # ============================================
 
 randomize_hostname() {
     log_info "Randomizing hostname..."
-    
-    # BUG FIX #7: Use more random components instead of predictable time
+
     local prefix=$(generate_prefix)
-    local random_num=$((RANDOM % 10000))
+    # Use a more random numeric component seeded from urandom
+    local num=$(od -An -N2 -tu2 /dev/urandom | tr -d ' ')
+    local random_num=$((num % 90000 + 10000))
     local new_hostname="${prefix}${random_num}"
-    
+
     # Validate hostname
-    if ! echo "$new_hostname" | grep -qE '^[a-zA-Z0-9\-]{2,63}$'; then
+    if ! echo "$new_hostname" | grep -qE '^[a-zA-Z0-9\\-]{2,63}$'; then
         log_error "Invalid hostname generated: $new_hostname"
         return 1
     fi
-    
+
     if ! uci set system.@system[0].hostname="$new_hostname" 2>/dev/null; then
         log_error "Failed to set hostname via UCI"
         return 1
     fi
-    
+
     if ! uci commit system 2>/dev/null; then
         log_error "Failed to commit hostname"
         return 1
     fi
-    
+
     hostname "$new_hostname" 2>/dev/null || log_error "Failed to set system hostname"
-    
+
     log_info "Hostname: $new_hostname"
     echo "$new_hostname" > "$CACHE_FILE.hostname"
 }
@@ -169,173 +180,171 @@ randomize_hostname() {
 
 randomize_wired_mac() {
     log_info "Randomizing wired interface MACs..."
-    
-    # WAN interface (eth0)
-    if ip link show eth0 >/dev/null 2>&1; then
-        local new_mac=$(generate_unique_mac)
-        
-        if ! ip link set eth0 down 2>/dev/null; then
-            log_error "Failed to bring down eth0"
-            return 1
-        fi
-        
-        sleep 0.2
-        
-        if ip link set eth0 address "$new_mac" 2>/dev/null; then
-            if ip link set eth0 up 2>/dev/null; then
-                log_info "eth0 MAC: $new_mac"
-            else
-                log_error "Failed to bring up eth0"
-                ip link set eth0 up 2>/dev/null || true
+
+    for interface in eth0 eth1 br-lan; do
+        if ip link show "$interface" >/dev/null 2>&1; then
+            local new_mac=$(generate_unique_mac)
+
+            if ! ip link set "$interface" down 2>/dev/null; then
+                log_error "Failed to bring down $interface"
+                continue
             fi
-        else
-            log_error "Failed to set eth0 MAC"
-            ip link set eth0 up 2>/dev/null || true
-        fi
-    fi
-    
-    # LAN interface (eth1)
-    if ip link show eth1 >/dev/null 2>&1; then
-        local new_mac=$(generate_unique_mac)
-        
-        if ! ip link set eth1 down 2>/dev/null; then
-            log_error "Failed to bring down eth1"
-            return 1
-        fi
-        
-        sleep 0.2
-        
-        if ip link set eth1 address "$new_mac" 2>/dev/null; then
-            if ip link set eth1 up 2>/dev/null; then
-                log_info "eth1 MAC: $new_mac"
+
+            sleep 0.2
+
+            if ip link set "$interface" address "$new_mac" 2>/dev/null; then
+                if ip link set "$interface" up 2>/dev/null; then
+                    log_info "$interface MAC: $new_mac"
+                else
+                    log_error "Failed to bring up $interface"
+                    ip link set "$interface" up 2>/dev/null || true
+                fi
             else
-                log_error "Failed to bring up eth1"
-                ip link set eth1 up 2>/dev/null || true
+                log_error "Failed to set $interface MAC"
+                ip link set "$interface" up 2>/dev/null || true
             fi
-        else
-            log_error "Failed to set eth1 MAC"
-            ip link set eth1 up 2>/dev/null || true
         fi
-    fi
-    
-    # Bridge interface (br-lan)
-    if ip link show br-lan >/dev/null 2>&1; then
-        local new_mac=$(generate_unique_mac)
-        if ip link set br-lan address "$new_mac" 2>/dev/null; then
-            log_info "br-lan MAC: $new_mac"
-        else
-            log_error "Failed to set br-lan MAC"
-        fi
-    fi
-    
-    # BUG FIX #3: IPv6 link-local address randomization
+    done
+
+    # IPv6 link-local address handling
     randomize_ipv6_mac
 }
 
 # IPv6 MAC address randomization (BUG FIX #3)
 randomize_ipv6_mac() {
     log_debug "Randomizing IPv6 addresses..."
-    
-    # Disable IPv6 privacy address if enabled (to force random generation)
+
+    # For interfaces present, reset temporary address settings and bounce
     for interface in eth0 eth1 br-lan wlan0 wlan1; do
-        if [ -f "/proc/sys/net/ipv6/conf/$interface/use_tempaddr" ]; then
-            echo 0 > "/proc/sys/net/ipv6/conf/$interface/use_tempaddr" 2>/dev/null || true
-            # Generate new IPv6 address by restarting interface
-            ip link set "$interface" down 2>/dev/null
+        if [ -d "/proc/sys/net/ipv6/conf/$interface" ]; then
+            # Turn off temporary addresses to avoid predictable EUI-64
+            if [ -f "/proc/sys/net/ipv6/conf/$interface/use_tempaddr" ]; then
+                echo 0 > "/proc/sys/net/ipv6/conf/$interface/use_tempaddr" 2>/dev/null || true
+            fi
+            # Restart interface to regenerate link-local
+            ip link set "$interface" down 2>/dev/null || true
             sleep 0.1
-            ip link set "$interface" up 2>/dev/null
+            ip link set "$interface" up 2>/dev/null || true
         fi
     done
-    
+
     log_debug "IPv6 addresses randomized"
 }
 
 # ============================================
-# 4. WiFi Configuration Randomization
+# 4. WiFi Configuration Randomization (robust)
 # ============================================
 
 randomize_wifi() {
     log_info "Randomizing WiFi configuration..."
-    
-    if ! uci get wireless.@wifi-device[0] >/dev/null 2>&1; then
-        log_error "No WiFi device found"
+
+    # Gather all wifi-iface sections
+    wifi_ifaces=$(uci show wireless 2>/dev/null | awk -F'=' '/=wifi-iface/ {split($1,a,"."); print a[2]}' | sort -u)
+    if [ -z "$wifi_ifaces" ]; then
+        log_error "No wifi-iface sections found"
         return 1
     fi
-    
+
     local prefix=$(generate_prefix)
-    local random_suffix=$((RANDOM % 10000))
+    local random_suffix=$(generate_random_suffix)
     local strong_pass=$(generate_strong_password)
-    
-    # BUG FIX #8: Check if WiFi interface exists before configuring
-    # 2.4G WiFi - BUG FIX #1: Properly randomize SSID instead of fixed "OWRT"
-    if uci get wireless.@wifi-device[0] >/dev/null 2>&1; then
-        # Verify that the interface actually exists
-        local wifi_dev_0=$(uci get wireless.@wifi-device[0].device 2>/dev/null)
-        
-        if [ -n "$wifi_dev_0" ] && [ -d "/sys/class/net/$wifi_dev_0" ]; then
-            local mac_2g=$(generate_unique_mac)
-            local ssid_2g="${prefix}${random_suffix}"
-            
-            if uci set wireless.@wifi-device[0].macaddr="$mac_2g" 2>/dev/null; then
-                if uci set wireless.@wifi-iface[0].ssid="$ssid_2g" 2>/dev/null; then
-                    uci set wireless.@wifi-iface[0].key="$strong_pass" 2>/dev/null || true
-                    uci set wireless.@wifi-iface[0].encryption="psk2+ccmp" 2>/dev/null || true
-                    log_info "2.4G WiFi: $ssid_2g | MAC: $mac_2g | Key: ****"
-                    echo "$ssid_2g" > "$CACHE_FILE.ssid_2g"
-                else
-                    log_error "Failed to set 2.4G WiFi SSID"
-                fi
-            else
-                log_error "Failed to set 2.4G WiFi MAC"
-            fi
-        else
-            log_error "2.4G WiFi device not found: $wifi_dev_0"
+
+    for iface in $wifi_ifaces; do
+        # get the device and hwmode if available
+        dev=$(uci get wireless.$iface.device 2>/dev/null)
+        hwmode=$(uci get wireless.$iface.hwmode 2>/dev/null || true)
+
+        # skip if device not present in /sys/class/net (some configs use 'radio0')
+        if [ -n "$dev" ] && [ ! -d "/sys/class/net/$dev" ]; then
+            log_debug "Wireless interface device $dev for section $iface not present, skipping"
+            continue
         fi
-    fi
-    
-    # 5G WiFi (if exists)
-    if uci get wireless.@wifi-device[1] >/dev/null 2>&1; then
-        local wifi_dev_1=$(uci get wireless.@wifi-device[1].device 2>/dev/null)
-        
-        if [ -n "$wifi_dev_1" ] && [ -d "/sys/class/net/$wifi_dev_1" ]; then
-            local mac_5g=$(generate_unique_mac)
-            local ssid_5g="${prefix}${random_suffix}_5G"
-            
-            if uci set wireless.@wifi-device[1].macaddr="$mac_5g" 2>/dev/null; then
-                if uci set wireless.@wifi-iface[1].ssid="$ssid_5g" 2>/dev/null; then
-                    uci set wireless.@wifi-iface[1].key="$strong_pass" 2>/dev/null || true
-                    uci set wireless.@wifi-iface[1].encryption="psk2+ccmp" 2>/dev/null || true
-                    log_info "5G WiFi: $ssid_5g | MAC: $mac_5g | Key: ****"
-                    echo "$ssid_5g" > "$CACHE_FILE.ssid_5g"
-                else
-                    log_error "Failed to set 5G WiFi SSID"
-                fi
-            else
-                log_error "Failed to set 5G WiFi MAC"
-            fi
-        else
-            log_error "5G WiFi device not found: $wifi_dev_1"
+
+        # Determine band tag (2G or 5G) by hwmode or device name
+        band_tag=""
+        if echo "$hwmode" | grep -i "11a\\|vht" >/dev/null 2>&1 || echo "$dev" | grep -E "5g|wifi1|wlan1|radio1" >/dev/null 2>&1; then
+            band_tag="_5G"
         fi
-    fi
-    
-    # Commit and restart WiFi
-    if ! uci commit wireless 2>/dev/null; then
-        log_error "Failed to commit wireless configuration"
+
+        # Compose SSID
+        ssid="${prefix}${random_suffix}${band_tag}"
+
+        # Set MAC for associated wifi-device if available
+        if [ -n "$dev" ]; then
+            # find the wifi-device section name referencing this device
+            wifi_dev_sections=$(uci show wireless 2>/dev/null | awk -F'=' '/=wifi-device/ {split($1,a,"."); print a[2]}' | while read -r s; do uci get wireless.$s.device 2>/dev/null | awk -v sec="$s" '{ if ($0==dev) print sec }' dev="$dev"; done)
+            # If above method didn't find, attempt common indices
+            if [ -z "$wifi_dev_sections" ]; then
+                # try radio0/radio1 mapping
+                wifi_dev_sections=$(uci show wireless 2>/dev/null | awk -F'=' '/=wifi-device/ {split($1,a,"."); print a[2]}')
+            fi
+            # set mac on first device section
+            first_dev_section=$(echo "$wifi_dev_sections" | head -n1)
+            if [ -n "$first_dev_section" ]; then
+                mac=$(generate_unique_mac)
+                uci set wireless.$first_dev_section.macaddr="$mac" 2>/dev/null || log_debug "Failed to set mac for $first_dev_section"
+                log_info "Set MAC $mac for wifi device $first_dev_section"
+            fi
+        fi
+
+        # Apply SSID
+        if uci set wireless.$iface.ssid="$ssid" 2>/dev/null; then
+            uci set wireless.$iface.encryption="psk2+ccmp" 2>/dev/null || true
+
+            # Preserve existing password if present; only generate on first run when key absent
+            current_key=$(uci get wireless.$iface.key 2>/dev/null || true)
+            if [ -n "$current_key" ]; then
+                log_info "Preserving existing WiFi key for $iface"
+            else
+                # Generate and set a new strong password only if there is no current key
+                new_pass=$(generate_strong_password)
+                if uci set wireless.$iface.key="$new_pass" 2>/dev/null; then
+                    # cache short-term for debugging, restrict permissions
+                    echo "$new_pass" > "/tmp/.fingerprint_cache.$iface" 2>/dev/null || true
+                    chmod 600 "/tmp/.fingerprint_cache.$iface" 2>/dev/null || true
+                    log_info "Generated and set strong WiFi key for $iface (length:16)"
+                else
+                    log_error "Failed to set WiFi key for $iface"
+                fi
+            fi
+
+            log_info "Configured $iface -> SSID: $ssid | Key: ****"
+            # Cache last SSID for debugging
+            echo "$ssid" > "$CACHE_FILE.$iface"
+        else
+            log_error "Failed to set ssid for $iface"
+        fi
+    done
+
+    # Commit and reload wireless with retry
+    retry=0
+    until [ $retry -ge 3 ]
+    do
+        if uci commit wireless 2>/dev/null; then
+            break
+        fi
+        retry=$((retry+1))
+        sleep 1
+    done
+    if [ $retry -ge 3 ]; then
+        log_error "Failed to commit wireless configuration after retries"
+        restore_config
         return 1
     fi
-    
-    # Safer WiFi restart with better error handling
-    (
-        sleep 2
-        if ! wifi down 2>/dev/null; then
-            log_debug "WiFi down command failed, continuing..."
+
+    # Use wifi reload if available, otherwise fallback
+    if command -v wifi >/dev/null 2>&1; then
+        if ! wifi reload 2>/dev/null; then
+            # try down/up sequence
+            wifi down 2>/dev/null || true
+            sleep 1
+            wifi up 2>/dev/null || true
         fi
-        sleep 2
-        if ! wifi up 2>/dev/null; then
-            log_error "WiFi up failed, manual restart may be required"
-        fi
-    ) &
-    
+    else
+        # Older systems: try /etc/init.d/network reload
+        /etc/init.d/network reload 2>/dev/null || log_debug "Network reload failed"
+    fi
+
     log_info "WiFi configuration updated"
 }
 
@@ -345,23 +354,20 @@ randomize_wifi() {
 
 hide_device_info() {
     log_info "Hiding device fingerprints..."
-    
+
     # Disable UPnP if enabled
     if uci get upnp.config.enabled >/dev/null 2>&1; then
         if [ "$(uci get upnp.config.enabled 2>/dev/null)" = "1" ]; then
-            if uci set upnp.config.enabled=0 2>/dev/null; then
-                uci commit upnp 2>/dev/null || true
-            fi
+            uci set upnp.config.enabled=0 2>/dev/null
+            uci commit upnp 2>/dev/null || true
         fi
     fi
-    
-    if /etc/init.d/upnpd stop >/dev/null 2>&1; then
-        log_info "UPnP disabled"
-    fi
-    
+
+    /etc/init.d/miniupnpd stop >/dev/null 2>&1 || /etc/init.d/upnpd stop >/dev/null 2>&1 || true
+
     # Hide SSDP broadcasts
     echo 1 > /proc/sys/net/ipv4/icmp_echo_ignore_broadcasts 2>/dev/null || true
-    
+
     # HTTP Server banner hiding
     if [ -f "/etc/config/uhttpd" ]; then
         if uci set uhttpd.main.http_keepalive=1 2>/dev/null; then
@@ -369,14 +375,14 @@ hide_device_info() {
             /etc/init.d/uhttpd restart >/dev/null 2>&1 || log_debug "uhttpd restart skipped"
         fi
     fi
-    
+
     # Disable SSH banner
     if [ -f "/etc/config/dropbear" ]; then
         if uci set dropbear.@dropbear[0].BannerFile=/dev/null 2>/dev/null; then
             uci commit dropbear 2>/dev/null || true
         fi
     fi
-    
+
     log_info "Device info hidden"
 }
 
@@ -386,47 +392,47 @@ hide_device_info() {
 
 clean_fingerprints() {
     log_info "Cleaning fingerprints..."
-    
-    # Clear logs (preserve system logs)
+
+    # Clear rotated logs but preserve running logs
     rm -f /var/log/*.log.* /var/log/*.gz 2>/dev/null || true
-    
+
     # Safely clear messages log without affecting running services
     if [ -f /var/log/messages ]; then
-        cp /dev/null /var/log/messages 2>/dev/null || true
+        : > /var/log/messages 2>/dev/null || true
     fi
-    
-    # BUG FIX #4: Safe /tmp cleaning - exclude important files
-    # Only remove fingerprint-related cache files and old logs
+
+    # Safe /tmp cleaning - exclude important files
+    # Only remove known fingerprint-related cache files and old logs
     rm -f /tmp/*.log 2>/dev/null || true
     rm -f /tmp/luci-* 2>/dev/null || true
     rm -f /tmp/*.lock 2>/dev/null || true
-    
+
     # Preserve critical runtime files by using more selective removal
     if [ -d /tmp ]; then
         find /tmp -maxdepth 1 -type f -mtime +1 -delete 2>/dev/null || true
     fi
-    
-    # Clear temp directory carefully
+
+    # Clear /var/tmp carefully
     if [ -d /var/tmp ]; then
         find /var/tmp -maxdepth 1 -type f -mtime +0 -delete 2>/dev/null || true
     fi
-    
+
     # Clear DHCP/DNS logs
-    [ -f /var/log/dnsmasq ] && cp /dev/null /var/log/dnsmasq 2>/dev/null || true
-    [ -f /var/log/dhcp.log ] && cp /dev/null /var/log/dhcp.log 2>/dev/null || true
-    
+    [ -f /var/log/dnsmasq ] && : > /var/log/dnsmasq 2>/dev/null || true
+    [ -f /var/log/dhcp.log ] && : > /var/log/dhcp.log 2>/dev/null || true
+
     # Clear Luci sessions
     rm -rf /var/luci-sessions/* 2>/dev/null || true
-    
+
     # Clear browser cache indicators
     rm -rf /tmp/.X* /tmp/luci-* 2>/dev/null || true
-    
+
     # Drop caches (safe operation)
     sync 2>/dev/null
     if [ -w /proc/sys/vm/drop_caches ]; then
         echo 3 > /proc/sys/vm/drop_caches 2>/dev/null || true
     fi
-    
+
     log_info "Fingerprints cleaned"
 }
 
@@ -436,23 +442,23 @@ clean_fingerprints() {
 
 randomize_network_params() {
     log_info "Randomizing network parameters..."
-    
+
     # Random MTU (1480-1500)
-    local random_mtu=$((1480 + (RANDOM % 21)))
-    
+    random_mtu=$((1480 + ($(od -An -N1 -tu1 /dev/urandom | tr -d ' ') % 21)))
+
     for interface in eth0 eth1 br-lan; do
         if ip link show "$interface" >/dev/null 2>&1; then
             ip link set dev "$interface" mtu "$random_mtu" 2>/dev/null || true
         fi
     done
-    
+
     # TCP settings for privacy
     echo 1 > /proc/sys/net/ipv4/tcp_timestamps 2>/dev/null || true
     echo 1 > /proc/sys/net/ipv4/ip_no_pmtu_disc 2>/dev/null || true
-    
+
     # Additional network fingerprint obfuscation
     echo 0 > /proc/sys/net/ipv4/tcp_window_scaling 2>/dev/null || true
-    
+
     log_info "Network params randomized (MTU: $random_mtu)"
 }
 
@@ -464,52 +470,55 @@ start() {
     log_info "==============================================="
     log_info "Device Fingerprint Randomization v4.1 Starting"
     log_info "==============================================="
-    
+
     # Initialize MAC history
-    > "$MAC_HISTORY" 2>/dev/null
-    
+    : > "$MAC_HISTORY" 2>/dev/null || true
+
     # Create backup
     backup_config
-    
+
     # Execute randomization sequence with error handling
     if ! randomize_hostname; then
         log_error "Hostname randomization failed"
+        restore_config
     fi
     sleep 1
-    
+
     if ! randomize_wired_mac; then
         log_error "Wired MAC randomization had issues"
+        restore_config
     fi
     sleep 1
-    
+
     if ! randomize_wifi; then
         log_error "WiFi randomization had issues"
+        restore_config
     fi
     sleep 2
-    
+
     if ! hide_device_info; then
         log_error "Device info hiding had issues"
     fi
     sleep 1
-    
+
     if ! clean_fingerprints; then
         log_error "Fingerprint cleaning had issues"
     fi
     sleep 1
-    
+
     if ! randomize_network_params; then
         log_error "Network params randomization had issues"
     fi
-    
+
     # Final report
     log_info "==============================================="
     log_info "Device Fingerprint Randomization Complete ✓"
     log_info "Device will be recognized as NEW by platforms"
     log_info "==============================================="
-    
+
     # Log completion with cache
     date > "$CACHE_FILE.timestamp"
-    
+
     # Cleanup MAC history file to save space
     rm -f "$MAC_HISTORY" 2>/dev/null || true
 }
